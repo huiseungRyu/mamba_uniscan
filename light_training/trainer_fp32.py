@@ -102,7 +102,7 @@ class Trainer:
             return DataLoader(dataset,
                                 batch_size=batch_size,
                                 shuffle=shuffle,
-                                num_workers=12)
+                                num_workers=0)
         else :
             if not train:
                 sampler = SequentialDistributedSampler(dataset, batch_size=batch_size)
@@ -111,7 +111,7 @@ class Trainer:
                 sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
             return DataLoader(dataset,
                                 batch_size=batch_size,
-                                num_workers=12, 
+                                num_workers=0,
                                 sampler=sampler, 
                                 drop_last=True)
 

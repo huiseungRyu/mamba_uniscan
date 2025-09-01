@@ -42,16 +42,18 @@ class BraTSTrainer(Trainer):
         return image, label, properties 
 
     def define_model_segmamba(self):
-        from model_segmamba.segmamba import SegMamba
+        #from model_segmamba.segmamba import SegMamba
         #from token_priority.token_priority_segmamba import SegMamba
         #from model_assm_only.irv2_mamba_assm_only import SegMamba
+        #from model_causal.segmamba_causal import SegMamba
+        from model_causal.segmamba_causal_fast import SegMamba
 
         model = SegMamba(in_chans=4,
                         out_chans=4,
                         depths=[2,2,2,2],
                         feat_size=[48, 96, 192, 384])
         
-        model_path = "/media/NAS/nas_187/huiseung/logs/segmamba/author/final_model_0.8456.pt"#base/new/model/final_model_0.8826.pt"#best_model_0.9368.pt"#tmp_model_ep99_0.8840.pt"
+        model_path = "/media/NAS/nas_187/huiseung/logs/segmamba/Causal_adventurer_fast/model/best_model_0.9305.pt"#tmp_model_ep99_0.8840.pt"
         new_sd = self.filte_state_dict(torch.load(model_path, map_location="cpu"))
         model.load_state_dict(new_sd)
         model.eval()
@@ -66,7 +68,7 @@ class BraTSTrainer(Trainer):
         predictor = Predictor(window_infer=window_infer,
                               mirror_axes=[0,1,2])
 
-        save_path = "/media/NAS/nas_187/huiseung/prediction_results/author/final_model"
+        save_path = "/media/NAS/nas_187/huiseung/prediction_results/Causal_adventurer_fast/epoch1000_best_model"
         os.makedirs(save_path, exist_ok=True)
 
         return model, predictor, save_path

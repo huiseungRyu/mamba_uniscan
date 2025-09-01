@@ -11,13 +11,16 @@
 
 from __future__ import annotations
 import torch.nn as nn
-import torch 
+import torch
 from functools import partial
 
 from monai.networks.blocks.dynunet_block import UnetOutBlock
 from monai.networks.blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
 from mamba_ssm import Mamba
-import torch.nn.functional as F 
+
+#from token_priority.slicesort_modified import RefSliceSoftSort # 수정
+import torch.nn.functional as F
+
 
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first.
@@ -25,6 +28,7 @@ class LayerNorm(nn.Module):
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs
     with shape (batch_size, channels, height, width).
     """
+
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(normalized_shape))
@@ -33,7 +37,7 @@ class LayerNorm(nn.Module):
         self.data_format = data_format
         if self.data_format not in ["channels_last", "channels_first"]:
             raise NotImplementedError
-        self.normalized_shape = (normalized_shape, )
+        self.normalized_shape = (normalized_shape,)
 
     def forward(self, x):
         if self.data_format == "channels_last":
@@ -46,22 +50,32 @@ class LayerNorm(nn.Module):
 
             return x
 
+
 class MambaLayer(nn.Module):
-    def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2, num_slices=None):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, num_slices=None, use_refsort=False):
         super().__init__()
         self.dim = dim
         self.norm = nn.LayerNorm(dim)
+        self.score_proj = nn.Linear(dim, 1) # 추가
+        #self.soft_sort = SoftSort(tau=1.0, hard=True, pow=1.0) # 원본
+        self.use_refsort = use_refsort
+        if use_refsort:
+            from token_priority.slicesort_modified import RefSliceSoftSort
+            self.soft_sort = RefSliceSoftSort(m=2048, tau=1.0, hard=True)  # 확실히 m 명시
+        else:
+            from token_priority.softsort import SoftSort  # 원본
+            self.soft_sort = SoftSort(tau=1.0, hard=True, pow=1.0)
+        # 한 방향 스캔을 위해 use_fast_path 플래그를 False로 강제
         self.mamba = Mamba(
-                d_model=dim, # Model dimension d_model
-                d_state=d_state,  # SSM state expansion factor
-                d_conv=d_conv,    # Local convolution width
-                expand=expand,    # Block expansion factor
-                bimamba_type="v3",
-                nslices=num_slices,
+            d_model=dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            bimamba_type="v1",
+            nslices=num_slices,
         )
-    
+
     def forward(self, x):
-        B, C = x.shape[:2]
         B, C = x.shape[:2]
         x_skip = x
         assert C == self.dim
@@ -69,15 +83,32 @@ class MambaLayer(nn.Module):
         img_dims = x.shape[2:]
         x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
         x_norm = self.norm(x_flat)
-        x_mamba = self.mamba(x_norm)
+        ### 수정 ###
+        scores = self.score_proj(x_norm).squeeze(-1)  # (B, n_tokens)
+        # ───────── 수정 전 ─────────
+        """
+        P_hat = self.soft_sort(scores) # 원본
+        x_sorted = torch.bmm(P_hat, x_norm)  # 원본
+        """
+        # ───────── 수정 후 ─────────
+        if self.use_refsort:
+            # RefSliceSoftSort → perm (B, n)
+            perm = self.soft_sort(scores)  # (B, n)
+            x_sorted = torch.gather(x_norm, 1, perm.unsqueeze(-1).expand(-1, -1, C))  # (B, n, C)
+        else:
+            # SoftSort → permutation matrix (B, n, n)
+            P_hat = self.soft_sort(scores)  # (B, n, n)
+            x_sorted = torch.bmm(P_hat, x_norm)  # (B, n, C)
 
+        x_mamba = self.mamba(x_sorted)
         out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
         out = out + x_skip
-        
+
         return out
-    
+
+
 class MlpChannel(nn.Module):
-    def __init__(self,hidden_size, mlp_dim, ):
+    def __init__(self, hidden_size, mlp_dim, ):
         super().__init__()
         self.fc1 = nn.Conv3d(hidden_size, mlp_dim, 1)
         self.act = nn.GELU()
@@ -88,6 +119,7 @@ class MlpChannel(nn.Module):
         x = self.act(x)
         x = self.fc2(x)
         return x
+
 
 class GSC(nn.Module):
     def __init__(self, in_channles) -> None:
@@ -110,8 +142,7 @@ class GSC(nn.Module):
         self.nonliner4 = nn.ReLU()
 
     def forward(self, x):
-
-        x_residual = x 
+        x_residual = x
 
         x1 = self.proj(x)
         x1 = self.norm(x1)
@@ -129,24 +160,26 @@ class GSC(nn.Module):
         x = self.proj4(x)
         x = self.norm4(x)
         x = self.nonliner4(x)
-        
+
         return x + x_residual
+
 
 class MambaEncoder(nn.Module):
     def __init__(self, in_chans=1, depths=[2, 2, 2, 2], dims=[48, 96, 192, 384],
                  drop_path_rate=0., layer_scale_init_value=1e-6, out_indices=[0, 1, 2, 3]):
         super().__init__()
 
-        self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
+        self.downsample_layers = nn.ModuleList()  # stem and 3 intermediate downsampling conv layers
         stem = nn.Sequential(
-              nn.Conv3d(in_chans, dims[0], kernel_size=7, stride=2, padding=3),
-              )
+            nn.Conv3d(in_chans, dims[0], kernel_size=7, stride=2, padding=3),
+        )
         self.downsample_layers.append(stem)
         for i in range(3):
+            stride = 2
             downsample_layer = nn.Sequential(
                 # LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
                 nn.InstanceNorm3d(dims[i]),
-                nn.Conv3d(dims[i], dims[i+1], kernel_size=2, stride=2),
+                nn.Conv3d(dims[i], dims[i + 1], kernel_size=stride, stride=stride),
             )
             self.downsample_layers.append(downsample_layer)
 
@@ -157,8 +190,12 @@ class MambaEncoder(nn.Module):
         for i in range(4):
             gsc = GSC(dims[i])
 
+            # ✅ stage 0, 1에서는 RefSliceSoftSort 사용
+            use_refsort = i < 2
+
             stage = nn.Sequential(
-                *[MambaLayer(dim=dims[i], num_slices=num_slices_list[i]) for j in range(depths[i])]
+                *[MambaLayer(dim=dims[i], num_slices=num_slices_list[i], use_refsort=use_refsort) for j in
+                  range(depths[i])]
             )
 
             self.stages.append(stage)
@@ -166,7 +203,6 @@ class MambaEncoder(nn.Module):
             cur += depths[i]
 
         self.out_indices = out_indices
-
         self.mlps = nn.ModuleList()
         for i_layer in range(4):
             layer = nn.InstanceNorm3d(dims[i_layer])
@@ -193,20 +229,21 @@ class MambaEncoder(nn.Module):
         x = self.forward_features(x)
         return x
 
+
 class SegMamba(nn.Module):
     def __init__(
-        self,
-        in_chans=1,
-        out_chans=13,
-        depths=[2, 2, 2, 2],
-        feat_size=[48, 96, 192, 384],
-        drop_path_rate=0,
-        layer_scale_init_value=1e-6,
-        hidden_size: int = 768,
-        norm_name = "instance",
-        conv_block: bool = True,
-        res_block: bool = True,
-        spatial_dims=3,
+            self,
+            in_chans=1,
+            out_chans=13,
+            depths=[2, 2, 2, 2],
+            feat_size=[48, 96, 192, 384],
+            drop_path_rate=0,
+            layer_scale_init_value=1e-6,
+            hidden_size: int = 768,
+            norm_name="instance",
+            conv_block: bool = True,
+            res_block: bool = True,
+            spatial_dims=3,
     ) -> None:
         super().__init__()
 
@@ -219,12 +256,12 @@ class SegMamba(nn.Module):
         self.layer_scale_init_value = layer_scale_init_value
 
         self.spatial_dims = spatial_dims
-        self.vit = MambaEncoder(in_chans, 
+        self.vit = MambaEncoder(in_chans,
                                 depths=depths,
                                 dims=feat_size,
                                 drop_path_rate=drop_path_rate,
                                 layer_scale_init_value=layer_scale_init_value,
-                              )
+                                )
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
             in_channels=self.in_chans,
@@ -326,33 +363,20 @@ class SegMamba(nn.Module):
         return x
 
     def forward(self, x_in):
-        print(f"Input x_in: {x_in.shape}")
         outs = self.vit(x_in)
-        for i, feat in enumerate(outs):
-            print(f"outs[{i}]: {feat.shape}")
         enc1 = self.encoder1(x_in)
-        print(f"enc1: {enc1.shape}")
         x2 = outs[0]
         enc2 = self.encoder2(x2)
-        print(f"enc2: {enc2.shape}")
         x3 = outs[1]
         enc3 = self.encoder3(x3)
-        print(f"enc3: {enc3.shape}")
         x4 = outs[2]
         enc4 = self.encoder4(x4)
-        print(f"enc4: {enc4.shape}")
         enc_hidden = self.encoder5(outs[3])
-        print(f"enc_hidden: {enc_hidden.shape}")
         dec3 = self.decoder5(enc_hidden, enc4)
-        print(f"dec3: {dec3.shape}")
         dec2 = self.decoder4(dec3, enc3)
-        print(f"dec2: {dec2.shape}")
         dec1 = self.decoder3(dec2, enc2)
-        print(f"dec1: {dec1.shape}")
         dec0 = self.decoder2(dec1, enc1)
-        print(f"dec0: {dec0.shape}")
         out = self.decoder1(dec0)
-        print(f"out: {out.shape}")
-                
+
         return self.out(out)
-    
+

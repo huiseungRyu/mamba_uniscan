@@ -13,7 +13,7 @@ from light_training.prediction import Predictor
 
 data_dir = "/media/NAS/nas_187/huiseung/fullres/train"
 env = "pytorch"
-max_epoch = 1000
+max_epoch = 100
 batch_size = 2
 val_every = 2
 num_gpus = 1
@@ -42,16 +42,16 @@ class BraTSTrainer(Trainer):
         return image, label, properties 
 
     def define_model_segmamba(self):
-        from model_segmamba.segmamba import SegMamba
+        #from model_segmamba.segmamba import SegMamba
         #from token_priority.token_priority_segmamba import SegMamba
-        #from model_assm_only.irv2_mamba_assm_only import SegMamba
+        from model_assm_only.irv2_mamba_assm_only import SegMamba # 수정
 
         model = SegMamba(in_chans=4,
                         out_chans=4,
                         depths=[2,2,2,2],
                         feat_size=[48, 96, 192, 384])
         
-        model_path = "/media/NAS/nas_187/huiseung/logs/segmamba/author/final_model_0.8456.pt"#base/new/model/final_model_0.8826.pt"#best_model_0.9368.pt"#tmp_model_ep99_0.8840.pt"
+        model_path = "/media/NAS/nas_187/huiseung/logs/segmamba/assm_only_new/model/tmp_model_ep99_0.9007.pt" # 수정
         new_sd = self.filte_state_dict(torch.load(model_path, map_location="cpu"))
         model.load_state_dict(new_sd)
         model.eval()
@@ -66,7 +66,7 @@ class BraTSTrainer(Trainer):
         predictor = Predictor(window_infer=window_infer,
                               mirror_axes=[0,1,2])
 
-        save_path = "/media/NAS/nas_187/huiseung/prediction_results/author/final_model"
+        save_path = "/media/NAS/nas_187/huiseung/prediction_results/assm_only/epoch100_tmp" # 수정
         os.makedirs(save_path, exist_ok=True)
 
         return model, predictor, save_path

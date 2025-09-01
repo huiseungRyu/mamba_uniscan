@@ -18,6 +18,40 @@ from monai.networks.blocks.dynunet_block import UnetOutBlock
 from monai.networks.blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
 from mamba_ssm import Mamba
 import torch.nn.functional as F 
+"""
+def flip_tokens(seq, flip=False):
+    ###
+    seq: (B, N, C)
+    flip=False -> return seq as-is
+    flip=True  -> concat( reversed(all but last), last )
+    ###
+    if not flip:
+        return seq
+    if seq.shape[1] <= 1:
+        # if there's only 1 token, can't meaningfully flip anything
+        return seq
+    return torch.cat([seq[:, :-1].flip(1), seq[:, -1:]], dim=1)
+"""
+
+def flip_tokens(seq):
+    """
+    Adventurer-style flipping:
+      - Keep the last token intact
+      - Flip everything else
+      - No 'has_special' or length-based heuristic.
+    """
+    if seq.shape[1] <= 1:
+        return seq
+    # 공식 Adventurer 코드:
+    return torch.cat([seq[:, :-1].flip(1), seq[:, -1:]], dim=1)
+
+
+def add_heading_avg(seq):
+    """
+    seq: (B, N, C)  →  (B, N+1, C)  (AVG + 패치들)
+    """
+    avg = seq.mean(dim=1, keepdim=True)
+    return torch.cat([avg, seq], dim=1)
 
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first.
@@ -56,20 +90,36 @@ class MambaLayer(nn.Module):
                 d_state=d_state,  # SSM state expansion factor
                 d_conv=d_conv,    # Local convolution width
                 expand=expand,    # Block expansion factor
-                bimamba_type="v3",
+                bimamba_type="v1",
                 nslices=num_slices,
         )
-    
-    def forward(self, x):
-        B, C = x.shape[:2]
+        self.mamba.use_fast_path = True  # 3방향 스캔 대신 단순 forward scan 수행하도록 (if문 무시)
+
+    #def forward(self, x):
+    def forward(self, x, flip=False):
         B, C = x.shape[:2]
         x_skip = x
         assert C == self.dim
         n_tokens = x.shape[2:].numel()
         img_dims = x.shape[2:]
         x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
+        """
         x_norm = self.norm(x_flat)
         x_mamba = self.mamba(x_norm)
+        """
+        # ---------- Adventurer-style wrapper ----------
+        if flip:  # ① (옵션) Flipping
+            x_flat = flip_tokens(x_flat)
+
+        x_flat = add_heading_avg(x_flat)  # ② AVG 토큰 삽입
+        x_flat = self.norm(x_flat)
+        x_flat = self.mamba(x_flat)  # ③ 1-way scan
+        x_flat = x_flat[:, 1:]  # ④ AVG 토큰 제거
+
+        if flip:  # ⑤ (옵션) 다시 Flipping
+            x_flat = flip_tokens(x_flat)
+
+        x_mamba = x_flat
 
         out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
         out = out + x_skip
@@ -157,10 +207,18 @@ class MambaEncoder(nn.Module):
         for i in range(4):
             gsc = GSC(dims[i])
 
+            """
             stage = nn.Sequential(
                 *[MambaLayer(dim=dims[i], num_slices=num_slices_list[i]) for j in range(depths[i])]
             )
+            """
+            blocks = []
+            for j in range(depths[i]):
+                blocks.append(
+                    MambaLayer(dim=dims[i], num_slices=num_slices_list[i])
+                )
 
+            stage = nn.ModuleList(blocks)
             self.stages.append(stage)
             self.gscs.append(gsc)
             cur += depths[i]
@@ -179,7 +237,11 @@ class MambaEncoder(nn.Module):
         for i in range(4):
             x = self.downsample_layers[i](x)
             x = self.gscs[i](x)
-            x = self.stages[i](x)
+            #x = self.stages[i](x)
+            # 두 Block마다 flip (Adventurer 규칙)
+            for idx, blk in enumerate(self.stages[i]):
+                flip_flag = (idx % 2 == 1)
+                x = blk(x, flip=flip_flag)
 
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
@@ -326,33 +388,20 @@ class SegMamba(nn.Module):
         return x
 
     def forward(self, x_in):
-        print(f"Input x_in: {x_in.shape}")
         outs = self.vit(x_in)
-        for i, feat in enumerate(outs):
-            print(f"outs[{i}]: {feat.shape}")
         enc1 = self.encoder1(x_in)
-        print(f"enc1: {enc1.shape}")
         x2 = outs[0]
         enc2 = self.encoder2(x2)
-        print(f"enc2: {enc2.shape}")
         x3 = outs[1]
         enc3 = self.encoder3(x3)
-        print(f"enc3: {enc3.shape}")
         x4 = outs[2]
         enc4 = self.encoder4(x4)
-        print(f"enc4: {enc4.shape}")
         enc_hidden = self.encoder5(outs[3])
-        print(f"enc_hidden: {enc_hidden.shape}")
         dec3 = self.decoder5(enc_hidden, enc4)
-        print(f"dec3: {dec3.shape}")
         dec2 = self.decoder4(dec3, enc3)
-        print(f"dec2: {dec2.shape}")
         dec1 = self.decoder3(dec2, enc2)
-        print(f"dec1: {dec1.shape}")
         dec0 = self.decoder2(dec1, enc1)
-        print(f"dec0: {dec0.shape}")
         out = self.decoder1(dec0)
-        print(f"out: {out.shape}")
                 
         return self.out(out)
     

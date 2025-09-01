@@ -1,31 +1,32 @@
+import sys, os
 import numpy as np
 from light_training.dataloading.dataset import get_train_val_test_loader_from_train
-import torch 
-import torch.nn as nn 
+import torch
+import torch.nn as nn
 from monai.inferers import SlidingWindowInferer
 from light_training.evaluation.metric import dice
 from light_training.trainer import Trainer
 from monai.utils import set_determinism
 from light_training.utils.files_helper import save_new_model_and_delete_last
 from monai.losses.dice import DiceLoss
+
 set_determinism(123)
 import os
 from thop import profile
-import torch
 import time
 
 data_dir = "/media/NAS/nas_187/huiseung/fullres/train"
-logdir = f"/media/NAS/nas_187/huiseung/logs/segmamba/1024_seperate"
+logdir = f"/media/NAS/nas_187/huiseung/logs/segmamba/for_mac_memory"
 
 model_save_path = os.path.join(logdir, "model")
 # augmentation = "nomirror"
 augmentation = True
 
 env = "DDP"
-max_epoch = 10
+max_epoch = 100
 batch_size = 1
 val_every = 2
-num_gpus = 3
+num_gpus = 2
 device = "cuda:0"
 roi_size = [128, 128, 128]
 
@@ -37,28 +38,32 @@ class BraTSTrainer(Trainer):
         super().__init__(env_type, max_epochs, batch_size, device, val_every, num_gpus, logdir, master_ip, master_port, training_script)
         self.window_infer = SlidingWindowInferer(roi_size=roi_size,
                                         sw_batch_size=1,
-                                        overlap=0.5)
+                                        overlap=0.5,
+                                        device=device)  # ✅ 가장 추천
         self.augmentation = augmentation
-        from model_segmamba.segmamba import SegMamba
-        from Proposed.model_modified import SegMamba
+        #from model_segmamba.segmamba import SegMamba
         #from token_priority.token_priority_segmamba import SegMamba
         #from model_assm_only.irv2_mamba_assm_only import SegMamba
+        #from model_causal.segmamba_causal import SegMamba
+        #from model_causal.segmamba_causal_fast import SegMamba
+        from model_causal.Adventurer_mamba_layer import SegMamba
 
         self.model = SegMamba(in_chans=4,
                         out_chans=4,
                         depths=[2,2,2,2],
                         feat_size=[48, 96, 192, 384])
         # 추가 #
+        self.model.cuda()
         self.train_memory_usage = []
         self.val_memory_usage = []
-        self.batch_size_for_memory = batch_size  # 💡 per-image memory 계산용
+        self.batch_size_for_memory = batch_size
         self.val_latencies = []  # validation latency 저장 리스트 추가
 
         self.patch_size = roi_size
         self.best_mean_dice = 0.0
         self.ce = nn.CrossEntropyLoss() 
         self.mse = nn.MSELoss()
-        self.train_process = 8
+        self.train_process = 18
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-2, weight_decay=3e-5,
                                     momentum=0.99, nesterov=True)
         
@@ -66,7 +71,7 @@ class BraTSTrainer(Trainer):
         self.cross = nn.CrossEntropyLoss()
 
     def training_step(self, batch):
-        torch.cuda.reset_peak_memory_stats() # 추가
+        torch.cuda.reset_peak_memory_stats()  # 추가
         image, label = self.get_input(batch)
         
         pred = self.model(image)
@@ -101,7 +106,7 @@ class BraTSTrainer(Trainer):
         
         else:
             return np.array([0.0, 50])
-    
+
     def validation_step(self, batch):
         torch.cuda.reset_peak_memory_stats()  # 스텝 단위 리셋(유지)
         torch.cuda.synchronize()
@@ -170,7 +175,6 @@ class BraTSTrainer(Trainer):
                                         f"final_model_{mean_dice:.4f}.pt"), 
                                         delete_symbol="final_model")
 
-
         if (self.epoch + 1) % 100 == 0:
             torch.save(self.model.state_dict(), os.path.join(model_save_path, f"tmp_model_ep{self.epoch}_{mean_dice:.4f}.pt"))
 
@@ -195,7 +199,7 @@ class BraTSTrainer(Trainer):
         self.model.to(device)
         self.model.eval()
 
-        dummy_input = torch.randn(1, 4, 64, 64, 64, device=device)
+        dummy_input = torch.randn(1, 4, 128, 128, 128, device=device)
 
         with torch.no_grad():
             macs, params = profile(self.model, inputs=(dummy_input,))
@@ -204,7 +208,6 @@ class BraTSTrainer(Trainer):
 
 
 if __name__ == "__main__":
-
     trainer = BraTSTrainer(env_type=env,
                             max_epochs=max_epoch,
                             batch_size=batch_size,
@@ -214,7 +217,7 @@ if __name__ == "__main__":
                             num_gpus=num_gpus,
                             master_port=17759,
                             training_script=__file__)
-    #trainer.measure_macs()  # 학습 시작 전에 MACs 계산
+    trainer.measure_macs()  # 학습 시작 전에 MACs 계산
     train_ds, val_ds, test_ds = get_train_val_test_loader_from_train(data_dir)
 
     trainer.train(train_dataset=train_ds, val_dataset=val_ds)

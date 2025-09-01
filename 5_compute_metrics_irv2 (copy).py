@@ -16,7 +16,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--pred_name", required=True, type=str)
 
-results_root = save_path = "/media/NAS/nas_187/huiseung/prediction_results/assb_glbtoken_3d"
+results_root = save_path = "/media/NAS/nas_187/huiseung/prediction_results/segirv2"
 args = parser.parse_args()
 
 pred_name = args.pred_name

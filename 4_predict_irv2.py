@@ -51,7 +51,7 @@ class BraTSTrainer(Trainer):
                         depths=[2,2,2,2],
                         feat_size=[48, 96, 192, 384])
         
-        model_path = "/media/NAS/nas_187/huiseung/logs/segmamba/author/final_model_0.8456.pt"#base/new/model/final_model_0.8826.pt"#best_model_0.9368.pt"#tmp_model_ep99_0.8840.pt"
+        model_path = "/media/NAS/nas_187/huiseung/logs/segmamba/base/new/model/final_model_0.8826.pt"#best_model_0.9368.pt"#tmp_model_ep99_0.8840.pt"
         new_sd = self.filte_state_dict(torch.load(model_path, map_location="cpu"))
         model.load_state_dict(new_sd)
         model.eval()
@@ -66,7 +66,7 @@ class BraTSTrainer(Trainer):
         predictor = Predictor(window_infer=window_infer,
                               mirror_axes=[0,1,2])
 
-        save_path = "/media/NAS/nas_187/huiseung/prediction_results/author/final_model"
+        save_path = "/media/NAS/nas_187/huiseung/prediction_results/base_new/epoch1000_final_model"
         os.makedirs(save_path, exist_ok=True)
 
         return model, predictor, save_path

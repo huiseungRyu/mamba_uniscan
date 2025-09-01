@@ -1,30 +1,25 @@
-# Copyright (c) MONAI Consortium
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#     http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
+import math
+import torch
 import torch.nn as nn
-import torch 
-from functools import partial
+import torch.nn.functional as F
 
 from monai.networks.blocks.dynunet_block import UnetOutBlock
 from monai.networks.blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
 from mamba_ssm import Mamba
-import torch.nn.functional as F 
+import torchsort
 
+
+# -----------------------------------------------------------------------------
+# Utility modules
+# -----------------------------------------------------------------------------
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first.
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs
     with shape (batch_size, channels, height, width).
     """
+
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(normalized_shape))
@@ -33,7 +28,7 @@ class LayerNorm(nn.Module):
         self.data_format = data_format
         if self.data_format not in ["channels_last", "channels_first"]:
             raise NotImplementedError
-        self.normalized_shape = (normalized_shape, )
+        self.normalized_shape = (normalized_shape,)
 
     def forward(self, x):
         if self.data_format == "channels_last":
@@ -46,38 +41,131 @@ class LayerNorm(nn.Module):
 
             return x
 
+def reorder_tokens_by_soft_rank(x, importance, regularization=1.0):
+    """
+    x           : (B, N, D)  — 정렬 대상 토큰
+    importance  : (B, N)     — 토큰별 importance score
+    returns y   : (B, N, D)  — importance 기준 정렬된 토큰 시퀀스
+    """
+    B, N, D = x.shape
+    # 1) soft rank (연속 순위) — [1..N] 범위, differentiable
+    soft_ranks = torchsort.soft_rank(
+        importance, regularization_strength=regularization
+    )                           # (B, N)
+    # 2) 정수/소수 부분 분리
+    rank_floor = torch.clamp(soft_ranks.floor().long(), 0, N - 1)       # (B, N)
+    frac = (soft_ranks - rank_floor.float())                            # (B, N)
+
+    # 3) 두 위치에 선형 보간 분배
+    y = x.new_zeros(B, N, D)
+
+    # 첫 번째 위치(가중치 = 1-frac)
+    y.scatter_add_(
+        dim=1,
+        index=rank_floor.unsqueeze(-1).expand(-1, -1, D),   # (B, N, D)
+        src=x * (1.0 - frac).unsqueeze(-1)
+    )
+
+    # 두 번째 위치(가중치 = frac) — rank_floor+1 이 범위를 넘지 않도록 마스크
+    mask = (rank_floor + 1 < N)
+    valid_idx = (rank_floor + 1).clamp(max=N-1)
+    y.scatter_add_(
+        dim=1,
+        index=valid_idx.unsqueeze(-1).expand(-1, -1, D),
+        src=(x * frac.unsqueeze(-1)) * mask.unsqueeze(-1)
+    )
+
+    return y
+
+# -----------------------------------------------------------------------------
+# Core MambaLayer with Demystifying‑style importance
+# -----------------------------------------------------------------------------
 class MambaLayer(nn.Module):
-    def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2, num_slices=None):
+    """Single‑scan Mamba layer + token re‑ordering.
+
+    * Importance score pipeline follows Demystifying‑the‑Token‑Dynamics (in_proj →
+      depth‑wise conv → x_proj → dt_proj → importance).
+    * Reordering with SoftSort (full) or RefSliceSoftSort (Top‑k memory‑efficient).
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            d_state: int = 16,
+            d_conv: int = 4,
+            expand: int = 2,
+            num_slices: int | None = None,
+            dt_rank: int | str = "auto",
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.norm = nn.LayerNorm(dim)
-        self.mamba = Mamba(
-                d_model=dim, # Model dimension d_model
-                d_state=d_state,  # SSM state expansion factor
-                d_conv=d_conv,    # Local convolution width
-                expand=expand,    # Block expansion factor
-                bimamba_type="v3",
-                nslices=num_slices,
-        )
-    
-    def forward(self, x):
-        B, C = x.shape[:2]
-        B, C = x.shape[:2]
-        x_skip = x
-        assert C == self.dim
-        n_tokens = x.shape[2:].numel()
-        img_dims = x.shape[2:]
-        x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
-        x_norm = self.norm(x_flat)
-        x_mamba = self.mamba(x_norm)
 
-        out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
-        out = out + x_skip
-        
+        # Demystifying parameters ------------------------------------------------
+        self.expand = expand
+        self.d_inner = dim * expand
+        self.d_state = d_state
+        self.dt_rank = math.ceil(dim / 16) if dt_rank == "auto" else dt_rank
+
+        # Projections ------------------------------------------------------------
+        self.in_proj = nn.Linear(dim, self.d_inner, bias=False)
+        self.conv1d_x = nn.Conv1d(self.d_inner // 2, self.d_inner // 2, kernel_size=d_conv,
+                                  padding="same", groups=self.d_inner // 2, bias=True)
+        self.conv1d_z = nn.Conv1d(self.d_inner // 2, self.d_inner // 2, kernel_size=d_conv,
+                                  padding="same", groups=self.d_inner // 2, bias=True)
+        self.x_proj = nn.Linear(self.d_inner // 2, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner // 2, bias=True)
+        self.importance = nn.Linear(self.d_inner // 2, 1, bias=False)
+
+        # Sorter ----------------------------------------------------------------
+
+        # Uniscan Mamba ----------------------------------------------------------
+        self.mamba = Mamba(
+            d_model=dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            bimamba_type="v1",  # uniscan
+            nslices=num_slices,
+        )
+
+    # -------------------------------------------------------------------------
+    # Forward
+    # -------------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: (B, C, D, H, W) or similar
+        B, C = x.shape[:2]
+        spatial_shape = x.shape[2:]
+        N = math.prod(spatial_shape)
+
+        x_skip = x
+        x_tok = x.reshape(B, C, N).transpose(1, 2)  # (B, N, C)
+        x_norm = self.norm(x_tok)
+
+        # Demystifying importance pipeline -------------------------------------
+        xz = self.in_proj(x_norm)  # (B, N, d_inner)
+        xz = xz.transpose(1, 2)  # (B, d_inner, N)
+        x_part, z_part = xz.chunk(2, dim=1)  # each (B, d_inner/2, N)
+
+        x_part = F.silu(self.conv1d_x(x_part))
+        z_part = F.silu(self.conv1d_z(z_part))
+
+        x_dbl = self.x_proj(x_part.transpose(1, 2))  # (B, N, dt_rank + 2*d_state)
+        dt, _, _ = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj(dt)  # (B, N, d_inner/2)
+
+        scores = self.importance(dt).squeeze(-1)  # (B, N)
+
+        # Sorting ---------------------------------------------------------------
+        x_sorted = reorder_tokens_by_soft_rank(x_norm, scores, regularization=1.0)
+
+        # Mamba + skip ----------------------------------------------------------
+        out = self.mamba(x_sorted)  # (B, N, C)
+        out = out.transpose(1, 2).reshape(B, C, *spatial_shape) + x_skip
         return out
-    
+
+
 class MlpChannel(nn.Module):
-    def __init__(self,hidden_size, mlp_dim, ):
+    def __init__(self, hidden_size, mlp_dim, ):
         super().__init__()
         self.fc1 = nn.Conv3d(hidden_size, mlp_dim, 1)
         self.act = nn.GELU()
@@ -88,6 +176,7 @@ class MlpChannel(nn.Module):
         x = self.act(x)
         x = self.fc2(x)
         return x
+
 
 class GSC(nn.Module):
     def __init__(self, in_channles) -> None:
@@ -110,8 +199,7 @@ class GSC(nn.Module):
         self.nonliner4 = nn.ReLU()
 
     def forward(self, x):
-
-        x_residual = x 
+        x_residual = x
 
         x1 = self.proj(x)
         x1 = self.norm(x1)
@@ -129,24 +217,25 @@ class GSC(nn.Module):
         x = self.proj4(x)
         x = self.norm4(x)
         x = self.nonliner4(x)
-        
+
         return x + x_residual
+
 
 class MambaEncoder(nn.Module):
     def __init__(self, in_chans=1, depths=[2, 2, 2, 2], dims=[48, 96, 192, 384],
                  drop_path_rate=0., layer_scale_init_value=1e-6, out_indices=[0, 1, 2, 3]):
         super().__init__()
 
-        self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
+        self.downsample_layers = nn.ModuleList()  # stem and 3 intermediate downsampling conv layers
         stem = nn.Sequential(
-              nn.Conv3d(in_chans, dims[0], kernel_size=7, stride=2, padding=3),
-              )
+            nn.Conv3d(in_chans, dims[0], kernel_size=7, stride=2, padding=3),
+        )
         self.downsample_layers.append(stem)
         for i in range(3):
             downsample_layer = nn.Sequential(
                 # LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
                 nn.InstanceNorm3d(dims[i]),
-                nn.Conv3d(dims[i], dims[i+1], kernel_size=2, stride=2),
+                nn.Conv3d(dims[i], dims[i + 1], kernel_size=2, stride=2),
             )
             self.downsample_layers.append(downsample_layer)
 
@@ -193,20 +282,21 @@ class MambaEncoder(nn.Module):
         x = self.forward_features(x)
         return x
 
+
 class SegMamba(nn.Module):
     def __init__(
-        self,
-        in_chans=1,
-        out_chans=13,
-        depths=[2, 2, 2, 2],
-        feat_size=[48, 96, 192, 384],
-        drop_path_rate=0,
-        layer_scale_init_value=1e-6,
-        hidden_size: int = 768,
-        norm_name = "instance",
-        conv_block: bool = True,
-        res_block: bool = True,
-        spatial_dims=3,
+            self,
+            in_chans=1,
+            out_chans=13,
+            depths=[2, 2, 2, 2],
+            feat_size=[48, 96, 192, 384],
+            drop_path_rate=0,
+            layer_scale_init_value=1e-6,
+            hidden_size: int = 768,
+            norm_name="instance",
+            conv_block: bool = True,
+            res_block: bool = True,
+            spatial_dims=3,
     ) -> None:
         super().__init__()
 
@@ -219,12 +309,12 @@ class SegMamba(nn.Module):
         self.layer_scale_init_value = layer_scale_init_value
 
         self.spatial_dims = spatial_dims
-        self.vit = MambaEncoder(in_chans, 
+        self.vit = MambaEncoder(in_chans,
                                 depths=depths,
                                 dims=feat_size,
                                 drop_path_rate=drop_path_rate,
                                 layer_scale_init_value=layer_scale_init_value,
-                              )
+                                )
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
             in_channels=self.in_chans,
@@ -326,33 +416,19 @@ class SegMamba(nn.Module):
         return x
 
     def forward(self, x_in):
-        print(f"Input x_in: {x_in.shape}")
         outs = self.vit(x_in)
-        for i, feat in enumerate(outs):
-            print(f"outs[{i}]: {feat.shape}")
         enc1 = self.encoder1(x_in)
-        print(f"enc1: {enc1.shape}")
         x2 = outs[0]
         enc2 = self.encoder2(x2)
-        print(f"enc2: {enc2.shape}")
         x3 = outs[1]
         enc3 = self.encoder3(x3)
-        print(f"enc3: {enc3.shape}")
         x4 = outs[2]
         enc4 = self.encoder4(x4)
-        print(f"enc4: {enc4.shape}")
         enc_hidden = self.encoder5(outs[3])
-        print(f"enc_hidden: {enc_hidden.shape}")
         dec3 = self.decoder5(enc_hidden, enc4)
-        print(f"dec3: {dec3.shape}")
         dec2 = self.decoder4(dec3, enc3)
-        print(f"dec2: {dec2.shape}")
         dec1 = self.decoder3(dec2, enc2)
-        print(f"dec1: {dec1.shape}")
         dec0 = self.decoder2(dec1, enc1)
-        print(f"dec0: {dec0.shape}")
         out = self.decoder1(dec0)
-        print(f"out: {out.shape}")
-                
+
         return self.out(out)
-    

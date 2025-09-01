@@ -11,13 +11,77 @@
 
 from __future__ import annotations
 import torch.nn as nn
-import torch 
+import torch
 from functools import partial
 
 from monai.networks.blocks.dynunet_block import UnetOutBlock
 from monai.networks.blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
 from mamba_ssm import Mamba
-import torch.nn.functional as F 
+import torch.nn.functional as F
+from timm.models.layers import DropPath
+
+"""
+def flip_tokens(seq, flip=False):
+    ###
+    seq: (B, N, C)
+    flip=False -> return seq as-is
+    flip=True  -> concat( reversed(all but last), last )
+    ###
+    if not flip:
+        return seq
+    if seq.shape[1] <= 1:
+        # if there's only 1 token, can't meaningfully flip anything
+        return seq
+    return torch.cat([seq[:, :-1].flip(1), seq[:, -1:]], dim=1)
+"""
+
+
+def flip_tokens(seq):
+    """
+    Adventurer-style flipping:
+      - Keep the last token intact
+      - Flip everything else
+      - No 'has_special' or length-based heuristic.
+    """
+    if seq.shape[1] <= 1:
+        return seq
+    # 공식 Adventurer 코드:
+    return torch.cat([seq[:, :-1].flip(1), seq[:, -1:]], dim=1)
+
+
+def add_heading_avg(seq):
+    """
+    seq: (B, N, C)  →  (B, N+1, C)  (AVG + 패치들)
+    """
+    avg = seq.mean(dim=1, keepdim=True)
+    return torch.cat([avg, seq], dim=1)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.SiLU, drop=0.,
+                 norm_layer=nn.LayerNorm, subln=False,):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.w1 = nn.Linear(in_features, hidden_features)
+        self.w2 = nn.Linear(in_features, hidden_features)
+
+        self.act = act_layer()
+        self.ffn_ln = norm_layer(hidden_features) if subln else nn.Identity()
+        self.w3 = nn.Linear(hidden_features, out_features)
+
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x1 = self.w1(x)
+        x2 = self.w2(x)
+        hidden = self.act(x1) * x2
+        x = self.ffn_ln(hidden)
+        x = self.w3(x)
+        x = self.drop(x)
+        return x
+
 
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first.
@@ -25,6 +89,7 @@ class LayerNorm(nn.Module):
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs
     with shape (batch_size, channels, height, width).
     """
+
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(normalized_shape))
@@ -33,7 +98,7 @@ class LayerNorm(nn.Module):
         self.data_format = data_format
         if self.data_format not in ["channels_last", "channels_first"]:
             raise NotImplementedError
-        self.normalized_shape = (normalized_shape, )
+        self.normalized_shape = (normalized_shape,)
 
     def forward(self, x):
         if self.data_format == "channels_last":
@@ -46,48 +111,59 @@ class LayerNorm(nn.Module):
 
             return x
 
+
 class MambaLayer(nn.Module):
-    def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2, num_slices=None):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, mlp_ratio=2.5, drop_path=0., num_slices=None):
         super().__init__()
         self.dim = dim
-        self.norm = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm(dim)
         self.mamba = Mamba(
-                d_model=dim, # Model dimension d_model
-                d_state=d_state,  # SSM state expansion factor
-                d_conv=d_conv,    # Local convolution width
-                expand=expand,    # Block expansion factor
-                bimamba_type="v3",
-                nslices=num_slices,
+            d_model=dim,  # Model dimension d_model
+            d_state=d_state,  # SSM state expansion factor
+            d_conv=d_conv,  # Local convolution width
+            expand=expand,  # Block expansion factor
+            bimamba_type="v1",
+            nslices=num_slices,
         )
-    
-    def forward(self, x):
-        B, C = x.shape[:2]
-        B, C = x.shape[:2]
-        x_skip = x
-        assert C == self.dim
-        n_tokens = x.shape[2:].numel()
-        img_dims = x.shape[2:]
-        x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
-        x_norm = self.norm(x_flat)
-        x_mamba = self.mamba(x_norm)
+        self.mamba.use_fast_path = True  # 3방향 스캔 대신 단순 forward scan 수행하도록 (if문 무시)
 
-        out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
-        out = out + x_skip
-        
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
+        self.drop1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    # def forward(self, x):
+    def forward(self, x, flip=False):
+        # x: (B, C, D, H, W) or after flatten (B, N, C)
+        # handle 5D: flatten then call same logic
+        is_5d = (x.dim() == 5)
+        if is_5d:
+            B, C, D, H, W = x.shape
+            N = D * H * W
+            x = x.view(B, C, N).transpose(1, 2)
+        # now x is (B, N, C)
+        seq = self.norm1(x)
+        # undo prev flip
+        if flip:
+            seq = flip_tokens(seq)
+        # insert avg token
+        seq = add_heading_avg(seq)
+        # token mixer
+        seq = self.mamba(seq)
+        seq = seq[:, 1:]
+        # post flip
+        if flip:
+            seq = flip_tokens(seq)
+        # residual token mixer
+        out = x + self.drop1(seq)
+        # channel mixer
+        y = self.mlp(self.norm2(out))
+        out = out + self.drop2(y)
+        # restore 5D
+        if is_5d:
+            out = out.transpose(1, 2).view(B, C, D, H, W)
         return out
-    
-class MlpChannel(nn.Module):
-    def __init__(self,hidden_size, mlp_dim, ):
-        super().__init__()
-        self.fc1 = nn.Conv3d(hidden_size, mlp_dim, 1)
-        self.act = nn.GELU()
-        self.fc2 = nn.Conv3d(mlp_dim, hidden_size, 1)
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        return x
 
 class GSC(nn.Module):
     def __init__(self, in_channles) -> None:
@@ -110,8 +186,7 @@ class GSC(nn.Module):
         self.nonliner4 = nn.ReLU()
 
     def forward(self, x):
-
-        x_residual = x 
+        x_residual = x
 
         x1 = self.proj(x)
         x1 = self.norm(x1)
@@ -129,24 +204,38 @@ class GSC(nn.Module):
         x = self.proj4(x)
         x = self.norm4(x)
         x = self.nonliner4(x)
-        
+
         return x + x_residual
+
+
+class MlpChannel(nn.Module):
+    def __init__(self,hidden_size, mlp_dim, ):
+        super().__init__()
+        self.fc1 = nn.Conv3d(hidden_size, mlp_dim, 1)
+        self.act = nn.GELU()
+        self.fc2 = nn.Conv3d(mlp_dim, hidden_size, 1)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
 
 class MambaEncoder(nn.Module):
     def __init__(self, in_chans=1, depths=[2, 2, 2, 2], dims=[48, 96, 192, 384],
                  drop_path_rate=0., layer_scale_init_value=1e-6, out_indices=[0, 1, 2, 3]):
         super().__init__()
 
-        self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
+        self.downsample_layers = nn.ModuleList()  # stem and 3 intermediate downsampling conv layers
         stem = nn.Sequential(
-              nn.Conv3d(in_chans, dims[0], kernel_size=7, stride=2, padding=3),
-              )
+            nn.Conv3d(in_chans, dims[0], kernel_size=7, stride=2, padding=3),
+        )
         self.downsample_layers.append(stem)
         for i in range(3):
             downsample_layer = nn.Sequential(
                 # LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
                 nn.InstanceNorm3d(dims[i]),
-                nn.Conv3d(dims[i], dims[i+1], kernel_size=2, stride=2),
+                nn.Conv3d(dims[i], dims[i + 1], kernel_size=2, stride=2),
             )
             self.downsample_layers.append(downsample_layer)
 
@@ -157,10 +246,13 @@ class MambaEncoder(nn.Module):
         for i in range(4):
             gsc = GSC(dims[i])
 
-            stage = nn.Sequential(
-                *[MambaLayer(dim=dims[i], num_slices=num_slices_list[i]) for j in range(depths[i])]
-            )
+            blocks = []
+            for j in range(depths[i]):
+                blocks.append(
+                    MambaLayer(dim=dims[i], num_slices=num_slices_list[i])
+                )
 
+            stage = nn.ModuleList(blocks)
             self.stages.append(stage)
             self.gscs.append(gsc)
             cur += depths[i]
@@ -179,7 +271,11 @@ class MambaEncoder(nn.Module):
         for i in range(4):
             x = self.downsample_layers[i](x)
             x = self.gscs[i](x)
-            x = self.stages[i](x)
+            # x = self.stages[i](x)
+            # 두 Block마다 flip (Adventurer 규칙)
+            for idx, blk in enumerate(self.stages[i]):
+                flip_flag = (idx % 2 == 1)
+                x = blk(x, flip=flip_flag)
 
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
@@ -193,20 +289,21 @@ class MambaEncoder(nn.Module):
         x = self.forward_features(x)
         return x
 
+
 class SegMamba(nn.Module):
     def __init__(
-        self,
-        in_chans=1,
-        out_chans=13,
-        depths=[2, 2, 2, 2],
-        feat_size=[48, 96, 192, 384],
-        drop_path_rate=0,
-        layer_scale_init_value=1e-6,
-        hidden_size: int = 768,
-        norm_name = "instance",
-        conv_block: bool = True,
-        res_block: bool = True,
-        spatial_dims=3,
+            self,
+            in_chans=1,
+            out_chans=13,
+            depths=[2, 2, 2, 2],
+            feat_size=[48, 96, 192, 384],
+            drop_path_rate=0,
+            layer_scale_init_value=1e-6,
+            hidden_size: int = 768,
+            norm_name="instance",
+            conv_block: bool = True,
+            res_block: bool = True,
+            spatial_dims=3,
     ) -> None:
         super().__init__()
 
@@ -219,12 +316,12 @@ class SegMamba(nn.Module):
         self.layer_scale_init_value = layer_scale_init_value
 
         self.spatial_dims = spatial_dims
-        self.vit = MambaEncoder(in_chans, 
+        self.vit = MambaEncoder(in_chans,
                                 depths=depths,
                                 dims=feat_size,
                                 drop_path_rate=drop_path_rate,
                                 layer_scale_init_value=layer_scale_init_value,
-                              )
+                                )
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
             in_channels=self.in_chans,
@@ -326,33 +423,20 @@ class SegMamba(nn.Module):
         return x
 
     def forward(self, x_in):
-        print(f"Input x_in: {x_in.shape}")
         outs = self.vit(x_in)
-        for i, feat in enumerate(outs):
-            print(f"outs[{i}]: {feat.shape}")
         enc1 = self.encoder1(x_in)
-        print(f"enc1: {enc1.shape}")
         x2 = outs[0]
         enc2 = self.encoder2(x2)
-        print(f"enc2: {enc2.shape}")
         x3 = outs[1]
         enc3 = self.encoder3(x3)
-        print(f"enc3: {enc3.shape}")
         x4 = outs[2]
         enc4 = self.encoder4(x4)
-        print(f"enc4: {enc4.shape}")
         enc_hidden = self.encoder5(outs[3])
-        print(f"enc_hidden: {enc_hidden.shape}")
         dec3 = self.decoder5(enc_hidden, enc4)
-        print(f"dec3: {dec3.shape}")
         dec2 = self.decoder4(dec3, enc3)
-        print(f"dec2: {dec2.shape}")
         dec1 = self.decoder3(dec2, enc2)
-        print(f"dec1: {dec1.shape}")
         dec0 = self.decoder2(dec1, enc1)
-        print(f"dec0: {dec0.shape}")
         out = self.decoder1(dec0)
-        print(f"out: {out.shape}")
-                
+
         return self.out(out)
-    
+

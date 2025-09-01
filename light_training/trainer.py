@@ -113,7 +113,7 @@ class Trainer:
             return DataLoader(dataset,
                                 batch_size=batch_size,
                                 shuffle=shuffle,
-                                num_workers=12)
+                                num_workers=0)
         else :
             if not train:
                 sampler = SequentialDistributedSampler(dataset, batch_size=batch_size)
@@ -122,7 +122,7 @@ class Trainer:
                 sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
             return DataLoader(dataset,
                                 batch_size=batch_size,
-                                num_workers=12, 
+                                num_workers=0,
                                 sampler=sampler, 
                                 drop_last=True)
 
@@ -211,6 +211,8 @@ class Trainer:
         return batch 
     
     def validation_single_gpu(self, val_dataset,):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         if self.ddp:
             print(f"single gpu model not support the ddp")
             exit(0)
@@ -269,6 +271,8 @@ class Trainer:
         val_outputs = []
         if self.global_step % self.val_every == 0 \
                 and self.val_loader is not None :
+            torch.cuda.empty_cache()  # 캐시 비우기
+            torch.cuda.reset_peak_memory_stats()  # 피크 0으로 초기화
             if self.model is not None:
                 self.model.eval()
             if self.ddp:
@@ -468,6 +472,12 @@ class Trainer:
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 12)
                         self.optimizer.step()
+
+                    # ──────── 여기가 ‘optimizer.step()’ 직후 - 밑에 3줄 수정 ────────
+                    torch.cuda.synchronize()  # ① GPU 연산 마무리
+                    tm_mb = torch.cuda.max_memory_allocated() / 1024**2  # ② ‘실사용’ TM
+                    self.train_memory_usage.append(tm_mb)  # ③ 로그 버퍼에 기록
+                    # ───────────────────────────────────────────────
 
                     if self.print_time:
                         e = time.time()

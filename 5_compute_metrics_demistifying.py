@@ -16,7 +16,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--pred_name", required=True, type=str)
 
-results_root = save_path = "/media/NAS/nas_187/huiseung/prediction_results/assb_glbtoken_3d"
+results_root = save_path = "/media/NAS/nas_187/huiseung/prediction_results/Demistifying_0416"
 args = parser.parse_args()
 
 pred_name = args.pred_name
@@ -66,12 +66,13 @@ if __name__ == "__main__":
         pred_itk = sitk.ReadImage(os.path.join(results_root, pred_name, f"{case_name}.nii.gz"))  # ✅ 절대 경로
         pred_array = sitk.GetArrayFromImage(pred_itk)
 
+        print(f"[{case_name}] GT shape: {gt_array.shape}, pred shape: {pred_array.shape}")
+
         m = each_cases_metric(gt_array, pred_array, voxel_spacing)
 
         all_results[ind, ...] = m
     
         ind += 1
-
 
     save_dir = os.path.join(results_root, "result_metrics")
     os.makedirs(save_dir, exist_ok=True)
